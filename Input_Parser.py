@@ -1,470 +1,124 @@
-import os
+from transformers import GPTNeoForCausalLM, GPT2Tokenizer
+import torch
 import re
 import json
-import zipfile
-import tempfile
-import traceback
+from datasets import Dataset
 
-import PyPDF2
-import torch
-import numpy as np
-from typing import List, Dict, Any
-import fitz  # PyMuPDF for better PDF image extraction
-from PIL import Image
-from transformers import (
-    pipeline,
-    AutoTokenizer,
-    AutoModelForTokenClassification,
-    ViTImageProcessor,
-    ViTForImageClassification,
-    ViTFeatureExtractor
-)
-class MathProblemParser:
-    def __init__(self, models_config: Dict[str, str] = None):
-        
-        self.default_models = {
-            "nlp_model": "facebook/bart-base",  
-            "text_extraction": "microsoft/layoutlm-base-uncased"
-        }
-        
-        
-        self.models_config = models_config or self.default_models
-        
-        
-        if pipeline is None or AutoTokenizer is None:
-            print("Warning: Transformers pipeline not available. Using fallback methods.")
-            self.nlp_pipeline = None
-            self.text_extractor = None
-            return
+class MathProblemSolver:
+    def __init__(self, model_name="EleutherAI/gpt-neo-1.3B"):
+        self.model_name = model_name
+        try:
+            self.tokenizer = GPT2Tokenizer.from_pretrained(self.model_name)
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.model = GPTNeoForCausalLM.from_pretrained(self.model_name)
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.model.to(self.device)
+            self.model.config.pad_token_id = self.tokenizer.pad_token_id
+            self.model_loaded = True
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            self.model_loaded = False
+
+    def parse_problem(self, problem_text):
+        """Extract key constraints and components from the problem"""
+        if not self.model_loaded:
+            return "default", {"error": "Model not loaded properly"}
         
         try:
+            # Extract category
+            category_match = re.search(r'\[(.*?)\]', problem_text)
+            category = category_match.group(1) if category_match else "unknown"
             
-            print("Loading NLP model...")
-            self.nlp_pipeline = pipeline(
-                "text2text-generation",
-                model=self.models_config["nlp_model"],
-                device=-1,  
-                model_kwargs={"low_cpu_mem_usage": True}
-            )
-            print("NLP model loaded successfully")
+            # Extract numerical values
+            numbers = re.findall(r'\d+(?:\.\d+)?', problem_text)
+            numerical_values = [float(n) for n in numbers]
             
+            # Extract variables
+            variables = re.findall(r'(?<![a-zA-Z])[a-zA-Z](?![a-zA-Z])', problem_text)
+            variables = list(set(variables))
             
-            try:
-                print("Loading text extraction model...")
-                tokenizer = AutoTokenizer.from_pretrained(self.models_config["text_extraction"])
-                
-                
-                model = AutoModelForTokenClassification.from_pretrained(
-                    self.models_config["text_extraction"],
-                    low_cpu_mem_usage=True,
-                    torch_dtype=torch.float32
-                ).to('cpu')  
-                
-                
-                self.text_extractor = pipeline(
-                    "token-classification",
-                    model=model.to('cpu'), 
-                    tokenizer=tokenizer,
-                    device=-1,
-                    aggregation_strategy="simple"
-                )
-                print("Text extraction model loaded successfully")
+            # Extract relationships
+            relationships = []
+            if "=" in problem_text:
+                relationships.extend(re.findall(r'[^=]+=\s*[^=]+', problem_text))
+            if ">" in problem_text or "<" in problem_text:
+                relationships.extend(re.findall(r'[^<>]+[<>]\s*[^<>]+', problem_text))
             
-            except Exception as model_init_error:
-                print(f"Error initializing text extraction model: {model_init_error}")
-                print("Falling back to default text processing methods.")
-                self.text_extractor = None
-        
+            # Extract constraints
+            constraints = []
+            constraint_keywords = ["must", "should", "only if", "if and only if", "such that", "where", "given that"]
+            for keyword in constraint_keywords:
+                if keyword in problem_text.lower():
+                    constraint_match = re.search(f"{keyword}(.*?)(?:\.|$)", problem_text, re.IGNORECASE)
+                    if constraint_match:
+                        constraints.append(constraint_match.group(1).strip())
+            
+            # Extract goal
+            goal = ""
+            goal_keywords = ["find", "determine", "calculate", "express", "compute"]
+            for keyword in goal_keywords:
+                if keyword in problem_text.lower():
+                    goal_match = re.search(f"{keyword}(.*?)(?:\.|$)", problem_text, re.IGNORECASE)
+                    if goal_match:
+                        goal = goal_match.group(1).strip()
+                        break
+            
+            return category.lower(), {
+                'numerical_values': numerical_values,
+                'variables': variables,
+                'relationships': relationships,
+                'constraints': constraints,
+                'goal': goal
+            }
+            
         except Exception as e:
-            print(f"Critical error in model initialization: {e}")
-            self.nlp_pipeline = None
-            self.text_extractor = None
-    def extract_pdf_text(self, pdf_path: str) -> Dict[str, Any]:
-        """
-        Extract structured text from PDF
-        """
+            print(f"Error parsing problem: {e}")
+            return "error", {"message": str(e)}
+
+    def parse_and_store_problems(self):
+        """Parse and store problem constraints from file"""
         try:
+            with open('IMO_High_Level_Problems.txt', 'r') as file:
+                problems = file.read().split('\n')
             
-            pdf_file = open(pdf_path, 'rb')
-            reader = PyPDF2.PdfReader(pdf_file)
+            parsed_results = []
+            for problem in problems:
+                if problem.strip():
+                    category, constraints = self.parse_problem(problem)
+                    parsed_results.append({
+                        'original_problem': problem,
+                        'category': category,
+                        'constraints': constraints
+                    })
             
-            document_info = {
-                "metadata": {},
-                "problems": []
-            }
+            with open('problem_constraints.json', 'w') as outfile:
+                json.dump(parsed_results, outfile, indent=4)
             
+            return parsed_results
             
-            document_info["metadata"] = {
-                "title": reader.metadata.get('/Title', 'Unknown'),
-                "filename": os.path.basename(pdf_path),
-                "total_pages": len(reader.pages)
-            }
-            
-            
-            full_text = ""
-            for page in reader.pages:
-                full_text += page.extract_text() + "\n\n"
-            
-            
-            pdf_file.close()
-            
-            
-            problem_matches = re.findall(r'Problem (\d+)\.\s*(.*?)(?=Problem \d|\Z)', full_text, re.DOTALL)
-            
-            for problem_num, problem_text in problem_matches:
-                problem_info = {
-                    "number": int(problem_num),
-                    "text": problem_text.strip(),
-                    "entities": self.extract_entities(problem_text),
-                    "constraints": self.map_constraints(problem_text)
-                }
-                document_info["problems"].append(problem_info)
-            
-            return document_info
-        
         except Exception as e:
-            print(f"Error extracting text from {pdf_path}: {e}")
-            
-            if 'pdf_file' in locals():
-                pdf_file.close()
-            return {
-                "metadata": {
-                    "filename": os.path.basename(pdf_path),
-                    "error": str(e)
-                }, 
-                "problems": []
-            }
+            print(f"Error parsing and storing problems: {e}")
+            return []
+
+def test_parser():
+    parser = MathProblemSolver()
     
-    def extract_entities(self, problem_text: str) -> List[Dict[str, Any]]:
-       
-        entities = []
+    test_problems = [
+        """[Geometry] A circle of radius 11 is inscribed in a right triangle with legs a and b. 
+        If the hypotenuse of the triangle is c, express the area of the triangle in terms of r.""",
         
+        """[Combinatorics] In how many ways can 3 students be selected from a group of 5 students 
+        if order does not matter?""",
         
-        patterns = {
-            "integer": r'\b(\d+)\b',
-            "variable": r'\b([a-zA-Z])\b',
-            "gcd": r'gcd\(',
-            "triangle": r'triangle\s+([A-Z]{3})',
-            "sequence": r'sequence\s+([a-z]\d*)'
-        }
-        
-        for entity_type, pattern in patterns.items():
-            matches = re.findall(pattern, problem_text)
-            for match in matches:
-                entities.append({
-                    "type": entity_type,
-                    "value": match
-                })
-        
-        return entities
-    
-    def map_constraints(self, problem_text: str) -> List[Dict[str, Any]]:
-        
-        constraints = []
-        
-        
-        constraint_rules = [
-            {
-                "pattern": r"for all (.*?),\s*(.*?)$",
-                "type": "universal_quantifier"
-            },
-            {
-                "pattern": r"there exists (.*?),\s*(.*?)$",
-                "type": "existential_quantifier"
-            }
-        ]
-        
-        for rule in constraint_rules:
-            matches = re.findall(rule["pattern"], problem_text, re.IGNORECASE)
-            for match in matches:
-                constraints.append({
-                    "type": rule["type"],
-                    "variables": match[0],
-                    "condition": match[1]
-                })
-        
-        return constraints
-    
-    def process_zip_file(self, zip_path: str) -> List[Dict[str, Any]]:
-        parsed_documents = []
-        
-        
-        with tempfile.TemporaryDirectory() as temp_dir:
-            
-            try:
-                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                    zip_ref.extractall(temp_dir)
-            except Exception as zip_error:
-                print(f"Error extracting ZIP file: {zip_error}")
-                return []
-            
-            
-            pdf_files = [f for f in os.listdir(temp_dir) if f.lower().endswith('.pdf')]
-            
-            print(f"Found {len(pdf_files)} PDF files to process")
-            
-            for filename in pdf_files:
-                full_path = os.path.join(temp_dir, filename)
-                try:
-                    document_info = self.extract_pdf_text(full_path)
-                    parsed_documents.append(document_info)
-                except Exception as e:
-                    print(f"Error processing {filename}: {e}")
-        
-        return parsed_documents
-    
-    def export_parsed_documents(self, parsed_documents: List[Dict[str, Any]], output_dir: str):
-        
-        
-        os.makedirs(output_dir, exist_ok=True)
-        
-        for doc in parsed_documents:
-            
-            filename = doc['metadata'].get('filename', f"document_{hash(str(doc))}.json")
-            output_path = os.path.join(output_dir, f"{os.path.splitext(filename)[0]}_parsed.json")
-            
-            with open(output_path, 'w', encoding='utf-8') as f:
-                json.dump(doc, f, indent=2, ensure_ascii=False)
-        
-        print(f"Exported {len(parsed_documents)} documents to {output_dir}")
-def get_entity_labels(self) -> List[str]:
-    
-    return [
-        "O",  
-        "B-INTEGER", "I-INTEGER",
-        "B-VARIABLE", "I-VARIABLE",
-        "B-OPERATION", "I-OPERATION",
-        "B-CONSTRAINT", "I-CONSTRAINT"
+        """[Number Theory] Find the sum of the digits of the largest three-digit number that is 
+        divisible by 7."""
     ]
-
-def train_model(self, training_data: List[Dict[str, Any]], epochs: int = 3):
-    if not self.text_extractor:
-        print("Text extraction model not initialized")
-        return
-
-    try:
-        from transformers import TrainingArguments, Trainer
-        import torch.nn as nn
-        
-        # Prepare training arguments
-        training_args = TrainingArguments(
-            output_dir="./model_checkpoints",
-            num_train_epochs=epochs,
-            per_device_train_batch_size=8,
-            learning_rate=2e-5,
-            weight_decay=0.01,
-            logging_dir="./logs",
-        )
-        
-        # Initialize trainer
-        trainer = Trainer(
-            model=self.model,
-            args=training_args,
-            train_dataset=self.prepare_dataset(training_data),
-        )
-        
-        # Train the model
-        trainer.train()
-        
-        # Update pipeline with trained model
-        self.text_extractor.model = self.model
-        
-        print("Model training completed successfully")
     
-    except Exception as e:
-        print(f"Error during model training: {e}")
-    def extract_pdf_text(self, pdf_path: str) -> Dict[str, Any]:
-        try:
-            
-            pdf_file = open(pdf_path, 'rb')
-            reader = PyPDF2.PdfReader(pdf_file)
-            
-            document_info = {
-                "metadata": {},
-                "problems": []
-            }
-            
-            
-            document_info["metadata"] = {
-                "title": reader.metadata.get('/Title', 'Unknown'),
-                "filename": os.path.basename(pdf_path),
-                "total_pages": len(reader.pages)
-            }
-            
-            
-            full_text = ""
-            for page in reader.pages:
-                full_text += page.extract_text() + "\n\n"
-            
-            
-            pdf_file.close()
-            
-            
-            problem_matches = re.findall(r'Problem (\d+)\.\s*(.*?)(?=Problem \d|\Z)', full_text, re.DOTALL)
-            
-            for problem_num, problem_text in problem_matches:
-                problem_info = {
-                    "number": int(problem_num),
-                    "text": problem_text.strip(),
-                    "entities": self.extract_entities(problem_text),
-                    "constraints": self.map_constraints(problem_text)
-                }
-                document_info["problems"].append(problem_info)
-            
-            return document_info
-        
-        except Exception as e:
-            print(f"Error extracting text from {pdf_path}: {e}")
-            
-            if 'pdf_file' in locals():
-                pdf_file.close()
-            return {
-                "metadata": {
-                    "filename": os.path.basename(pdf_path),
-                    "error": str(e)
-                }, 
-                "problems": []
-            }
-    
-    def extract_entities(self, problem_text: str) -> List[Dict[str, Any]]:
-        
-        entities = []
-        
-        
-        patterns = {
-            "integer": r'\b(\d+)\b',
-            "variable": r'\b([a-zA-Z])\b',
-            "gcd": r'gcd\(',
-            "triangle": r'triangle\s+([A-Z]{3})',
-            "sequence": r'sequence\s+([a-z]\d*)'
-        }
-        
-        for entity_type, pattern in patterns.items():
-            matches = re.findall(pattern, problem_text)
-            for match in matches:
-                entities.append({
-                    "type": entity_type,
-                    "value": match
-                })
-        
-        return entities
-    
-    def map_constraints(self, problem_text: str) -> List[Dict[str, Any]]:
-        constraints = []
-        
-        
-        constraint_rules = [
-            {
-                "pattern": r"for all (.*?),\s*(.*?)$",
-                "type": "universal_quantifier"
-            },
-            {
-                "pattern": r"there exists (.*?),\s*(.*?)$",
-                "type": "existential_quantifier"
-            }
-        ]
-        
-        for rule in constraint_rules:
-            matches = re.findall(rule["pattern"], problem_text, re.IGNORECASE)
-            for match in matches:
-                constraints.append({
-                    "type": rule["type"],
-                    "variables": match[0],
-                    "condition": match[1]
-                })
-        
-        return constraints
-    
-    def process_zip_file(self, zip_path: str) -> List[Dict[str, Any]]:
-        parsed_documents = []
-        
-        
-        with tempfile.TemporaryDirectory() as temp_dir:
-            
-            try:
-                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                    zip_ref.extractall(temp_dir)
-            except Exception as zip_error:
-                print(f"Error extracting ZIP file: {zip_error}")
-                return []
-            
-            
-            pdf_files = [f for f in os.listdir(temp_dir) if f.lower().endswith('.pdf')]
-            
-            print(f"Found {len(pdf_files)} PDF files to process")
-            
-            for filename in pdf_files:
-                full_path = os.path.join(temp_dir, filename)
-                try:
-                    document_info = self.extract_pdf_text(full_path)
-                    parsed_documents.append(document_info)
-                except Exception as e:
-                    print(f"Error processing {filename}: {e}")
-        
-        return parsed_documents
-    
-    def export_parsed_documents(self, parsed_documents: List[Dict[str, Any]], output_dir: str):
-        os.makedirs(output_dir, exist_ok=True)
-        
-        for doc in parsed_documents:
-            
-            filename = doc['metadata'].get('filename', f"document_{hash(str(doc))}.json")
-            output_path = os.path.join(output_dir, f"{os.path.splitext(filename)[0]}_parsed.json")
-            
-            with open(output_path, 'w', encoding='utf-8') as f:
-                json.dump(doc, f, indent=2, ensure_ascii=False)
-        
-        print(f"Exported {len(parsed_documents)} documents to {output_dir}")
-def main():
-    try:
-        
-        os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-        
-        
-        try:
-            parser = MathProblemParser()
-            if parser.nlp_pipeline is None:
-                print("Warning: NLP pipeline initialization failed. Check model availability and dependencies.")
-        except Exception as model_error:
-            print(f"Error initializing MathProblemParser: {model_error}")
-            return
-    
-        
-        zip_file_path = '/content/Problems_Cide.zip'
-        output_directory = '/content/OutputFolder'
-        
-        
-        os.makedirs(output_directory, exist_ok=True)
-        
-        
-        if not os.path.exists(zip_file_path):
-            print(f"Error: ZIP file not found at {zip_file_path}")
-            return
-        
-        
-        parsed_documents = parser.process_zip_file(zip_file_path)
-        
-        
-        if not parsed_documents:
-            print("No documents were parsed. Check the ZIP file contents and file paths.")
-            return
-        
-        
-        parser.export_parsed_documents(parsed_documents, output_directory)
-        
-        
-        for doc in parsed_documents:
-            print(f"Document: {doc['metadata'].get('filename', 'Unknown')}")
-            for problem in doc.get('problems', []):
-                print(f"Problem {problem.get('number', 'N/A')}")
-                print(f"Entities: {len(problem.get('entities', []))}")
-                print(f"Constraints: {len(problem.get('constraints', []))}")
-                print("-" * 50)
-    
-    except Exception as e:
-        print(f"Error processing ZIP file: {e}")
-        traceback.print_exc()
+    for problem in test_problems:
+        print("\nProblem:", problem)
+        category, constraints = parser.parse_problem(problem)
+        print("Category:", category)
+        print("Constraints:", json.dumps(constraints, indent=2))
 
 if __name__ == "__main__":
-    main()
+    test_parser()
